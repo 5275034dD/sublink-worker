@@ -6,7 +6,7 @@ export const GITHUB_API_RELEASES = 'https://api.github.com/repos/7Sageer/sublink
 export const DOCS_URL = 'https://sublink.works';
 
 // SEO and metadata
-export const APP_KEYWORDS = 'clash, singbox, surge, subscription, converter, sublink';
+export const APP_KEYWORDS = 'clash, mihomo, clashmeta, singbox, surge, subscription, converter, sublink';
 
 // Subtitles for different languages
 export const APP_SUBTITLE = {
@@ -15,3 +15,26 @@ export const APP_SUBTITLE = {
     'fa': 'تجمیع و مدیریت کارآمد نودهای پروکسی شما',
     'ru': 'Эффективная агрегация и управление вашими прокси-узлами'
 };
+
+// Supported client targets for UI and API validation
+export const CLIENT_TYPES = [
+    { label: 'Mihomo (Clash Meta)', value: 'mihomo' },
+    { label: 'Clash', value: 'clash' },
+    { label: 'Sing-Box', value: 'singbox' },
+    { label: 'Surge', value: 'surge' },
+    { label: 'Shadowrocket', value: 'shadowrocket' },
+    { label: 'Quantumult X', value: 'quanx' },
+    { label: 'Loon', value: 'loon' }
+];
+
+export const SUPPORTED_TARGETS = [
+    'mihomo',
+    'clashmeta',
+    'meta',
+    'clash',
+    'singbox',
+    'surge',
+    'shadowrocket',
+    'quanx',
+    'loon'
+];
