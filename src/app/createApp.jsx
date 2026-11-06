@@ -379,3 +379,240 @@ export function createApp(bindings = {}) {
             const code = await shortLinks.createShortLink(queryString, c.req.query('shortCode'));
             return c.text(code);
         } catch (error) {
+            return handleError(c, error, runtime.logger);
+        }
+    });
+
+    const redirectHandler = (prefix) => async (c) => {
+        try {
+            const code = c.req.param('code');
+            const shortLinks = requireShortLinkService(services.shortLinks);
+            const originalParam = await shortLinks.resolveShortCode(code);
+            if (!originalParam) return c.text('Short URL not found', 404);
+
+            const url = new URL(c.req.url);
+            return c.redirect(`${url.origin}/${prefix}${originalParam}`);
+        } catch (error) {
+            return handleError(c, error, runtime.logger);
+        }
+    };
+
+    app.get('/s/:code', redirectHandler('surge'));
+    app.get('/b/:code', redirectHandler('singbox'));
+    app.get('/c/:code', redirectHandler('clash'));
+    app.get('/m/:code', redirectHandler('mihomo')); // 新增：/m/短链接重定向至 /mihomo
+    app.get('/x/:code', redirectHandler('xray'));
+
+    app.post('/config', async (c) => {
+        try {
+            const { type, content } = await c.req.json();
+            const storage = requireConfigStorage(services.configStorage);
+            const configId = await storage.saveConfig(type, content);
+            return c.text(configId);
+        } catch (error) {
+            if (error instanceof SyntaxError) {
+                return c.text(`Invalid format: ${error.message}`, 400);
+            }
+            return handleError(c, error, runtime.logger);
+        }
+    });
+
+    app.get('/resolve', async (c) => {
+        try {
+            const shortUrl = c.req.query('url');
+            const t = c.get('t');
+            if (!shortUrl) return c.text(t('missingUrl'), 400);
+
+            let urlObj;
+            try {
+                urlObj = new URL(shortUrl);
+            } catch {
+                return c.text(t('invalidShortUrl'), 400);
+            }
+            const pathParts = urlObj.pathname.split('/');
+            if (pathParts.length < 3) return c.text(t('invalidShortUrl'), 400);
+
+            const prefix = pathParts[1];
+            const shortCode = pathParts[2];
+            if (!['b', 'c', 'm', 'x', 's'].includes(prefix)) return c.text(t('invalidShortUrl'), 400);
+
+            const shortLinks = requireShortLinkService(services.shortLinks);
+            const originalParam = await shortLinks.resolveShortCode(shortCode);
+            if (!originalParam) return c.text(t('shortUrlNotFound'), 404);
+
+            const mapping = { b: 'singbox', c: 'clash', m: 'mihomo', x: 'xray', s: 'surge' };
+            const originalUrl = `${urlObj.origin}/${mapping[prefix]}${originalParam}`;
+            return c.json({ originalUrl });
+        } catch (error) {
+            return handleError(c, error, runtime.logger);
+        }
+    });
+
+    app.get('/favicon.ico', async (c) => {
+        if (!runtime.assetFetcher) {
+            return c.notFound();
+        }
+        try {
+            return await runtime.assetFetcher(c.req.raw);
+        } catch (error) {
+            runtime.logger.warn('Asset fetch failed', error);
+            return c.notFound();
+        }
+    });
+
+    return app;
+}
+
+export function parseSelectedRules(raw) {
+    if (!raw) return [];
+
+    if (typeof raw === 'string' && PREDEFINED_RULE_SETS[raw]) {
+        return PREDEFINED_RULE_SETS[raw];
+    }
+
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        console.warn(`Failed to parse selectedRules: ${raw}, falling back to minimal`);
+        return PREDEFINED_RULE_SETS.minimal;
+    }
+}
+
+function parseJsonArray(raw) {
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function parseBooleanFlag(value) {
+    return value === 'true' || value === true;
+}
+
+function parseSemverLike(value) {
+    if (typeof value !== 'string') {
+        return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return null;
+    }
+    const match = trimmed.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+    if (!match) {
+        return null;
+    }
+    return {
+        major: Number(match[1]),
+        minor: Number(match[2]),
+        patch: match[3] ? Number(match[3]) : 0
+    };
+}
+
+function isSingboxLegacyConfig(version) {
+    if (!version || Number.isNaN(version.major) || Number.isNaN(version.minor)) {
+        return false;
+    }
+    if (version.major !== 1) {
+        return version.major < 1;
+    }
+    return version.minor < 12;
+}
+
+function isSingboxModernConfig(version) {
+    if (!version || Number.isNaN(version.major) || Number.isNaN(version.minor)) {
+        return false;
+    }
+    if (version.major !== 1) {
+        return version.major > 1;
+    }
+    return version.minor >= 14;
+}
+
+function resolveSingboxConfigTier(version) {
+    if (isSingboxLegacyConfig(version)) return '1.11';
+    return isSingboxModernConfig(version) ? '1.14' : '1.12';
+}
+
+function resolveSingboxConfigVersion(requestedVersion, userAgent) {
+    const normalizedRequested = typeof requestedVersion === 'string' ? requestedVersion.trim().toLowerCase() : '';
+    if (normalizedRequested && normalizedRequested !== 'auto') {
+        if (normalizedRequested === 'legacy') return '1.11';
+        if (normalizedRequested === 'latest') return '1.14';
+        const parsed = parseSemverLike(normalizedRequested);
+        if (parsed) {
+            return resolveSingboxConfigTier(parsed);
+        }
+    }
+
+    if (typeof userAgent === 'string' && userAgent) {
+        const uaMatch = userAgent.match(/sing-box\/(\d+\.\d+(?:\.\d+)?)/i) || userAgent.match(/sing-box\s+(\d+\.\d+(?:\.\d+)?)/i);
+        const versionString = uaMatch?.[1];
+        const parsed = versionString ? parseSemverLike(versionString) : null;
+        if (parsed) {
+            return resolveSingboxConfigTier(parsed);
+        }
+    }
+
+    return '1.12';
+}
+
+function getRequestHeader(request, name) {
+    if (!request || !name) {
+        return undefined;
+    }
+
+    try {
+        const value = request.header(name);
+        if (value !== undefined) {
+            return value;
+        }
+    } catch {
+        // Fallback if HonoRequest.header cannot read from the raw request.
+    }
+
+    const headers = request.raw?.headers;
+    if (!headers) {
+        return undefined;
+    }
+
+    if (typeof headers.get === 'function') {
+        return headers.get(name) ?? headers.get(name.toLowerCase()) ?? undefined;
+    }
+
+    if (typeof headers === 'object') {
+        const lowerName = name.toLowerCase();
+        const headerValue = headers[lowerName] ?? headers[name];
+        if (Array.isArray(headerValue)) {
+            return headerValue[0];
+        }
+        return headerValue;
+    }
+
+    return undefined;
+}
+
+function requireShortLinkService(service) {
+    if (!service) {
+        throw new MissingDependencyError('Short link functionality is unavailable');
+    }
+    return service;
+}
+
+function requireConfigStorage(service) {
+    if (!service) {
+        throw new MissingDependencyError('Config storage functionality is unavailable');
+    }
+    return service;
+}
+
+function handleError(c, error, logger) {
+    if (error instanceof ServiceError) {
+        return c.text(error.message, error.status);
+    }
+    logger.error?.('Unhandled error', error);
+    return c.text(`Error: ${error.message}`, 500);
+}
