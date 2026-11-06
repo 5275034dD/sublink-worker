@@ -8,6 +8,7 @@ import { Footer } from '../components/Footer.jsx';
 import { UpdateChecker } from '../components/UpdateChecker.jsx';
 import { SingboxConfigBuilder } from '../builders/SingboxConfigBuilder.js';
 import { ClashConfigBuilder } from '../builders/ClashConfigBuilder.js';
+import { MihomoConfigBuilder } from '../builders/MihomoConfigBuilder.js';
 import { SurgeConfigBuilder } from '../builders/SurgeConfigBuilder.js';
 import { createTranslator, resolveLanguage } from '../i18n/index.js';
 import { encodeBase64, tryDecodeSubscriptionLines } from '../utils.js';
@@ -149,6 +150,56 @@ export function createApp(bindings = {}) {
             }
 
             const builder = new ClashConfigBuilder(
+                config,
+                selectedRules,
+                customRules,
+                baseConfig,
+                lang,
+                ua,
+                groupByCountry,
+                enableClashUI,
+                externalController,
+                externalUiDownloadUrl,
+                includeAutoSelect
+            );
+            await builder.build();
+            const userinfo = builder.getSubscriptionUserinfo();
+            const headers = { 'Content-Type': 'text/yaml; charset=utf-8' };
+            if (userinfo) {
+                headers['subscription-userinfo'] = userinfo;
+            }
+            return c.text(builder.formatConfig(), 200, headers);
+        } catch (error) {
+            return handleError(c, error, runtime.logger);
+        }
+    });
+
+    // 新增：Mihomo (Clash Meta) 专属订阅生成接口
+    app.get('/mihomo', async (c) => {
+        try {
+            const config = c.req.query('config');
+            if (!config) {
+                return c.text('Missing config parameter', 400);
+            }
+
+            const selectedRules = parseSelectedRules(c.req.query('selectedRules'));
+            const customRules = parseJsonArray(c.req.query('customRules'));
+            const ua = c.req.query('ua') || getRequestHeader(c.req, 'User-Agent') || DEFAULT_USER_AGENT;
+            const groupByCountry = parseBooleanFlag(c.req.query('group_by_country'));
+            const includeAutoSelect = c.req.query('include_auto_select') !== 'false';
+            const enableClashUI = parseBooleanFlag(c.req.query('enable_clash_ui'));
+            const externalController = c.req.query('external_controller');
+            const externalUiDownloadUrl = c.req.query('external_ui_download_url');
+            const configId = c.req.query('configId');
+            const lang = c.get('lang');
+
+            let baseConfig;
+            if (configId?.startsWith('mihomo_') || configId?.startsWith('clash_')) {
+                const storage = requireConfigStorage(services.configStorage);
+                baseConfig = await storage.getConfigById(configId);
+            }
+
+            const builder = new MihomoConfigBuilder(
                 config,
                 selectedRules,
                 customRules,
@@ -328,245 +379,3 @@ export function createApp(bindings = {}) {
             const code = await shortLinks.createShortLink(queryString, c.req.query('shortCode'));
             return c.text(code);
         } catch (error) {
-            return handleError(c, error, runtime.logger);
-        }
-    });
-
-    const redirectHandler = (prefix) => async (c) => {
-        try {
-            const code = c.req.param('code');
-            const shortLinks = requireShortLinkService(services.shortLinks);
-            const originalParam = await shortLinks.resolveShortCode(code);
-            if (!originalParam) return c.text('Short URL not found', 404);
-
-            const url = new URL(c.req.url);
-            return c.redirect(`${url.origin}/${prefix}${originalParam}`);
-        } catch (error) {
-            return handleError(c, error, runtime.logger);
-        }
-    };
-
-    app.get('/s/:code', redirectHandler('surge'));
-    app.get('/b/:code', redirectHandler('singbox'));
-    app.get('/c/:code', redirectHandler('clash'));
-    app.get('/x/:code', redirectHandler('xray'));
-
-    app.post('/config', async (c) => {
-        try {
-            const { type, content } = await c.req.json();
-            const storage = requireConfigStorage(services.configStorage);
-            const configId = await storage.saveConfig(type, content);
-            return c.text(configId);
-        } catch (error) {
-            if (error instanceof SyntaxError) {
-                return c.text(`Invalid format: ${error.message}`, 400);
-            }
-            return handleError(c, error, runtime.logger);
-        }
-    });
-
-    app.get('/resolve', async (c) => {
-        try {
-            const shortUrl = c.req.query('url');
-            const t = c.get('t');
-            if (!shortUrl) return c.text(t('missingUrl'), 400);
-
-            let urlObj;
-            try {
-                urlObj = new URL(shortUrl);
-            } catch {
-                return c.text(t('invalidShortUrl'), 400);
-            }
-            const pathParts = urlObj.pathname.split('/');
-            if (pathParts.length < 3) return c.text(t('invalidShortUrl'), 400);
-
-            const prefix = pathParts[1];
-            const shortCode = pathParts[2];
-            if (!['b', 'c', 'x', 's'].includes(prefix)) return c.text(t('invalidShortUrl'), 400);
-
-            const shortLinks = requireShortLinkService(services.shortLinks);
-            const originalParam = await shortLinks.resolveShortCode(shortCode);
-            if (!originalParam) return c.text(t('shortUrlNotFound'), 404);
-
-            const mapping = { b: 'singbox', c: 'clash', x: 'xray', s: 'surge' };
-            const originalUrl = `${urlObj.origin}/${mapping[prefix]}${originalParam}`;
-            return c.json({ originalUrl });
-        } catch (error) {
-            return handleError(c, error, runtime.logger);
-        }
-    });
-
-    app.get('/favicon.ico', async (c) => {
-        if (!runtime.assetFetcher) {
-            return c.notFound();
-        }
-        try {
-            return await runtime.assetFetcher(c.req.raw);
-        } catch (error) {
-            runtime.logger.warn('Asset fetch failed', error);
-            return c.notFound();
-        }
-    });
-
-    return app;
-}
-
-export function parseSelectedRules(raw) {
-    if (!raw) return [];
-
-    // 首先检查是否是预设名称 (minimal, balanced, comprehensive)
-    // 这确保向后兼容主分支的 API 行为
-    if (typeof raw === 'string' && PREDEFINED_RULE_SETS[raw]) {
-        return PREDEFINED_RULE_SETS[raw];
-    }
-
-    // 尝试解析为 JSON 数组
-    try {
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed : [];
-    } catch {
-        // 解析失败，回退到 minimal 预设
-        console.warn(`Failed to parse selectedRules: ${raw}, falling back to minimal`);
-        return PREDEFINED_RULE_SETS.minimal;
-    }
-}
-
-function parseJsonArray(raw) {
-    if (!raw) return [];
-    try {
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed : [];
-    } catch {
-        return [];
-    }
-}
-
-function parseBooleanFlag(value) {
-    return value === 'true' || value === true;
-}
-
-function parseSemverLike(value) {
-    if (typeof value !== 'string') {
-        return null;
-    }
-    const trimmed = value.trim();
-    if (!trimmed) {
-        return null;
-    }
-    const match = trimmed.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
-    if (!match) {
-        return null;
-    }
-    return {
-        major: Number(match[1]),
-        minor: Number(match[2]),
-        patch: match[3] ? Number(match[3]) : 0
-    };
-}
-
-function isSingboxLegacyConfig(version) {
-    if (!version || Number.isNaN(version.major) || Number.isNaN(version.minor)) {
-        return false;
-    }
-    if (version.major !== 1) {
-        return version.major < 1;
-    }
-    return version.minor < 12;
-}
-
-// 1.14 swaps rule-set download_detour for http_client, which older clients
-// reject as an unknown field, so it needs its own config tier.
-function isSingboxModernConfig(version) {
-    if (!version || Number.isNaN(version.major) || Number.isNaN(version.minor)) {
-        return false;
-    }
-    if (version.major !== 1) {
-        return version.major > 1;
-    }
-    return version.minor >= 14;
-}
-
-function resolveSingboxConfigTier(version) {
-    if (isSingboxLegacyConfig(version)) return '1.11';
-    return isSingboxModernConfig(version) ? '1.14' : '1.12';
-}
-
-function resolveSingboxConfigVersion(requestedVersion, userAgent) {
-    const normalizedRequested = typeof requestedVersion === 'string' ? requestedVersion.trim().toLowerCase() : '';
-    if (normalizedRequested && normalizedRequested !== 'auto') {
-        if (normalizedRequested === 'legacy') return '1.11';
-        if (normalizedRequested === 'latest') return '1.14';
-        const parsed = parseSemverLike(normalizedRequested);
-        if (parsed) {
-            return resolveSingboxConfigTier(parsed);
-        }
-    }
-
-    if (typeof userAgent === 'string' && userAgent) {
-        const uaMatch = userAgent.match(/sing-box\/(\d+\.\d+(?:\.\d+)?)/i) || userAgent.match(/sing-box\s+(\d+\.\d+(?:\.\d+)?)/i);
-        const versionString = uaMatch?.[1];
-        const parsed = versionString ? parseSemverLike(versionString) : null;
-        if (parsed) {
-            return resolveSingboxConfigTier(parsed);
-        }
-    }
-
-    return '1.12';
-}
-
-function getRequestHeader(request, name) {
-    if (!request || !name) {
-        return undefined;
-    }
-
-    try {
-        const value = request.header(name);
-        if (value !== undefined) {
-            return value;
-        }
-    } catch {
-        // Fallback if HonoRequest.header cannot read from the raw request.
-    }
-
-    const headers = request.raw?.headers;
-    if (!headers) {
-        return undefined;
-    }
-
-    if (typeof headers.get === 'function') {
-        return headers.get(name) ?? headers.get(name.toLowerCase()) ?? undefined;
-    }
-
-    if (typeof headers === 'object') {
-        const lowerName = name.toLowerCase();
-        const headerValue = headers[lowerName] ?? headers[name];
-        if (Array.isArray(headerValue)) {
-            return headerValue[0];
-        }
-        return headerValue;
-    }
-
-    return undefined;
-}
-
-function requireShortLinkService(service) {
-    if (!service) {
-        throw new MissingDependencyError('Short link functionality is unavailable');
-    }
-    return service;
-}
-
-function requireConfigStorage(service) {
-    if (!service) {
-        throw new MissingDependencyError('Config storage functionality is unavailable');
-    }
-    return service;
-}
-
-function handleError(c, error, logger) {
-    if (error instanceof ServiceError) {
-        return c.text(error.message, error.status);
-    }
-    logger.error?.('Unhandled error', error);
-    return c.text(`Error: ${error.message}`, 500);
-}
